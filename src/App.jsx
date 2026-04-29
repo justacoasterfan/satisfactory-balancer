@@ -30,7 +30,6 @@ const BELT_TIERS = [
   { level: 6, rate: 1200, color: '#ec4899' },  // Mk.6
 ];
 
-// Fallback clipboard copy (handles iframe restrictions)
 const copyToClipboard = (text) => {
   if (navigator.clipboard && window.isSecureContext) {
     navigator.clipboard.writeText(text);
@@ -60,8 +59,8 @@ function generateBalancer(inputs, outputs, maxTier) {
     nodes.push({ id, type, rate, label, layer: 0, x: 0, y: 0 });
     return id;
   };
-  const addEdge = (source, target, rate) => {
-    edges.push({ id: getId('Edge'), source, target, rate });
+  const addEdge = (source, target, rate, isThrottle = false) => {
+    edges.push({ id: getId('Edge'), source, target, rate, isThrottle });
   };
 
   // 1. Setup Phase
@@ -116,18 +115,47 @@ function generateBalancer(inputs, outputs, maxTier) {
 
     let rem = target.rate - target.connected;
 
-    // Exact Match
+    // A. Exact Match Priority
     let exactIdx = available.findIndex(a => Math.abs(a.rate - rem) < 0.001);
     if (exactIdx !== -1) {
       let b = available.splice(exactIdx, 1)[0];
-      target.inputs.push(b);
+      target.inputs.push({ ...b, isThrottle: false });
       target.connected += b.rate;
       continue;
     }
 
+    // B. Throttle / Manifold Match Priority
+    let tierMatchMade = false;
+    for (let i = 0; i < targets.length; i++) {
+        let t = targets[i];
+        let tRem = t.rate - t.connected;
+        if (tRem < 0.001) continue;
+
+        let matchingTier = BELT_TIERS.find(tier => Math.abs(tier.rate - tRem) < 0.001);
+        if (matchingTier) {
+            let bIdx = available.findIndex(a => a.rate > tRem + 0.001);
+            if (bIdx !== -1) {
+                let belt = available.splice(bIdx, 1)[0];
+                let sId = addNode('Splitter', belt.rate, 'Splitter');
+                addEdge(belt.source, sId, belt.rate);
+
+                // Output 1 goes directly to target, tagged as a throttle
+                t.inputs.push({ source: sId, rate: tRem, isThrottle: true });
+                t.connected += tRem;
+
+                // Output 2 is the remainder
+                available.push({ source: sId, rate: belt.rate - tRem });
+                
+                tierMatchMade = true;
+                break;
+            }
+        }
+    }
+    if (tierMatchMade) continue;
+
+    // C. Standard Fractional Split
     let belt = available[0];
 
-    // Split
     if (belt.rate > rem + 0.001) {
       available.shift();
       let sId = addNode('Splitter', belt.rate, 'Splitter');
@@ -149,10 +177,9 @@ function generateBalancer(inputs, outputs, maxTier) {
         available.push({ source: sId, rate: newRate });
       }
     } 
-    // Merge
     else {
       available.shift();
-      target.inputs.push(belt);
+      target.inputs.push({ ...belt, isThrottle: false });
       target.connected += belt.rate;
     }
   }
@@ -160,7 +187,7 @@ function generateBalancer(inputs, outputs, maxTier) {
   // 4. Expansion Phase
   targets.forEach(t => {
     if (t.inputs.length === 1) {
-      addEdge(t.inputs[0].source, t.id, t.inputs[0].rate);
+      addEdge(t.inputs[0].source, t.id, t.inputs[0].rate, t.inputs[0].isThrottle);
     } else if (t.inputs.length > 1) {
       let currentInputs = [...t.inputs];
       while (currentInputs.length > 3) {
@@ -168,13 +195,13 @@ function generateBalancer(inputs, outputs, maxTier) {
         let mergedRate = currentInputs[0].rate + currentInputs[1].rate + currentInputs[2].rate;
         let mId = addNode('Merger', mergedRate, 'Merger');
         for (let i = 0; i < 3; i++) {
-          addEdge(currentInputs[i].source, mId, currentInputs[i].rate);
+          addEdge(currentInputs[i].source, mId, currentInputs[i].rate, currentInputs[i].isThrottle);
         }
-        currentInputs.splice(0, 3, { source: mId, rate: mergedRate });
+        currentInputs.splice(0, 3, { source: mId, rate: mergedRate, isThrottle: false });
       }
       let finalMId = addNode('Merger', t.rate, 'Merger');
       currentInputs.forEach(inp => {
-        addEdge(inp.source, finalMId, inp.rate);
+        addEdge(inp.source, finalMId, inp.rate, inp.isThrottle);
       });
       addEdge(finalMId, t.id, t.rate);
     }
@@ -232,11 +259,11 @@ function generateBalancer(inputs, outputs, maxTier) {
 
 // --- UI COMPONENTS ---
 export default function App() {
-  const [inputs, setInputs] = useState([{ id: 1, rate: 120, count: 1 }]);
-  const [outputs, setOutputs] = useState([{ id: 1, rate: 40, count: 3 }]);
+  const [inputs, setInputs] = useState([{ id: 1, rate: 270, count: 1 }]);
+  const [outputs, setOutputs] = useState([{ id: 1, rate: 60, count: 1 }, { id: 2, rate: 210, count: 1 }]);
   const [maxTier, setMaxTier] = useState(270);
   const [graph, setGraph] = useState({ nodes: [], edges: [] });
-  const [nodeStates, setNodeStates] = useState({}); // { [nodeId]: { built: true, byName: 'Bob', byUid: '123' } }
+  const [nodeStates, setNodeStates] = useState({}); 
   
   const [error, setError] = useState('');
   const [zoom, setZoom] = useState(1);
@@ -244,13 +271,11 @@ export default function App() {
   const [isPanning, setIsPanning] = useState(false);
   const [draggingNodeId, setDraggingNodeId] = useState(null);
 
-  // Multiplayer State
   const [user, setUser] = useState(null);
   const [userName, setUserName] = useState('');
   const [sessionId, setSessionId] = useState(new URLSearchParams(window.location.search).get('session') || null);
   const [copied, setCopied] = useState(false);
 
-  // Firebase Auth Setup
   useEffect(() => {
     if (!auth) return;
     const initAuth = async () => {
@@ -269,7 +294,6 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Firebase Realtime Sync
   useEffect(() => {
     if (!user || !db || !sessionId) return;
     
@@ -277,13 +301,11 @@ export default function App() {
     const unsubscribe = onSnapshot(docRef, (snap) => {
       if (snap.exists()) {
         const data = snap.data();
-        // Sync configuration silently
         if (data.inputs) setInputs(data.inputs);
         if (data.outputs) setOutputs(data.outputs);
         if (data.maxTier) setMaxTier(data.maxTier);
         if (data.nodeStates) setNodeStates(data.nodeStates);
 
-        // Auto-generate graph to match server state
         if (data.inputs && data.outputs) {
            const flatInputs = data.inputs.flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
            const flatOutputs = data.outputs.flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
@@ -302,17 +324,14 @@ export default function App() {
 
   const handleGenerate = async () => {
     setError('');
-    
     if (inputs.length === 0 || outputs.length === 0) {
       setError('You need at least one input and one output.');
       return;
     }
-    
     if (Math.abs(totalInput - totalOutput) > 0.001) {
       setError(`Imbalanced! Total Input (${totalInput}) must equal Total Output (${totalOutput}).`);
       return;
     }
-
     if (inputs.some(i => i.rate > maxTier) || outputs.some(o => o.rate > maxTier)) {
       setError(`A single belt cannot exceed the Max Tier limit (${maxTier} items/min).`);
       return;
@@ -321,13 +340,12 @@ export default function App() {
     const flatInputs = inputs.flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
     const flatOutputs = outputs.flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
 
-    setNodeStates({}); // Clear progress on structural change
+    setNodeStates({});
     const newGraph = generateBalancer(flatInputs, flatOutputs, maxTier);
     setGraph(newGraph);
     setZoom(1);
     setPan({ x: 50, y: 50 });
 
-    // Sync structural changes if in session
     if (sessionId && db && user) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'sessions', sessionId);
@@ -338,11 +356,19 @@ export default function App() {
     }
   };
 
-  // Generate on initial load only if NOT in a session (if in session, sync listener does it)
   useEffect(() => {
     if (!sessionId) handleGenerate();
-    // eslint-disable-next-line
   }, []);
+
+  const edgeGroups = useMemo(() => {
+    const groups = {};
+    graph.edges.forEach(e => {
+      const key = `${e.source}_${e.target}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(e);
+    });
+    return groups;
+  }, [graph.edges]);
 
   const addInput = () => setInputs([...inputs, { id: Date.now(), rate: 60, count: 1 }]);
   const removeInput = (id) => setInputs(inputs.filter(i => i.id !== id));
@@ -352,7 +378,6 @@ export default function App() {
   const removeOutput = (id) => setOutputs(outputs.filter(o => o.id !== id));
   const updateOutput = (id, field, val) => setOutputs(outputs.map(o => o.id === id ? { ...o, [field]: Number(val) } : o));
 
-  // Panning, Zoom & Drag Handlers
   const handleMouseDown = (e) => {
     if (e.button !== 0) return; 
     setIsPanning(true);
@@ -379,16 +404,13 @@ export default function App() {
   const toggleNodeBuilt = async (id) => {
     const isCurrentlyBuilt = nodeStates[id]?.built;
     const newState = !isCurrentlyBuilt;
-    
     const newStates = { ...nodeStates };
     if (newState) {
       newStates[id] = { built: true, byName: userName.trim() || 'Anonymous', byUid: user?.uid || 'local' };
     } else {
       delete newStates[id];
     }
-    
-    setNodeStates(newStates); // Optimistic
-
+    setNodeStates(newStates); 
     if (sessionId && db && user) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'sessions', sessionId);
@@ -401,7 +423,6 @@ export default function App() {
 
   const startSession = async () => {
     if (!db || !user) { setError("Connecting to server, please wait..."); return; }
-    
     const newSid = Math.random().toString(36).substring(2, 10);
     try {
       const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'sessions', newSid);
@@ -421,8 +442,6 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-slate-900 text-slate-200 font-sans overflow-hidden">
-      
-      {/* Sidebar Controls */}
       <div className="w-80 bg-slate-800 border-r border-slate-700 flex flex-col h-full shadow-2xl z-10">
         <div className="p-5 border-b border-slate-700 bg-slate-800">
           <h1 className="text-xl font-bold text-orange-400 flex items-center gap-2">
@@ -433,14 +452,11 @@ export default function App() {
         </div>
 
         <div className="flex-1 overflow-y-auto p-5 space-y-6">
-          
-          {/* Collaboration Panel */}
           <div className="bg-slate-900/50 p-4 rounded-lg border border-slate-700">
             <h2 className="text-sm font-semibold text-slate-300 flex items-center gap-2 mb-3">
               <Users className="w-4 h-4 text-blue-400" />
               Multiplayer Sync
             </h2>
-            
             <input 
               type="text" 
               placeholder="Your Display Name" 
@@ -448,7 +464,6 @@ export default function App() {
               onChange={e => setUserName(e.target.value)}
               className="w-full bg-slate-900 border border-slate-600 rounded p-2 text-sm outline-none focus:border-blue-500 transition-colors mb-3"
             />
-
             {!sessionId ? (
               <button 
                 onClick={startSession}
@@ -472,7 +487,6 @@ export default function App() {
             )}
           </div>
 
-          {/* Max Tier Selector */}
           <div>
             <label className="block text-sm font-semibold text-slate-300 mb-2">Maximum Belt Tier</label>
             <select 
@@ -490,10 +504,9 @@ export default function App() {
 
           <hr className="border-slate-700" />
 
-          {/* Inputs */}
           <div>
             <div className="flex justify-between items-center mb-2">
-              <label className="text-sm font-semibold text-slate-300">Inputs (Total: {totalInput.toFixed(1)})</label>
+              <label className="text-sm font-semibold text-slate-300">Inputs ({totalInput.toFixed(1)})</label>
               <button onClick={addInput} className="text-orange-400 hover:text-orange-300 p-1 bg-slate-700 rounded transition-colors">
                 <Plus className="w-4 h-4" />
               </button>
@@ -502,33 +515,18 @@ export default function App() {
               {inputs.map((inp, i) => (
                 <div key={inp.id} className="flex gap-2 items-center">
                   <span className="bg-slate-700 px-2 py-1.5 rounded text-xs font-mono flex-shrink-0 flex items-center">In {i+1}</span>
-                  <input 
-                    type="number" min="0" step="any"
-                    value={inp.rate} 
-                    onChange={(e) => updateInput(inp.id, 'rate', e.target.value)}
-                    className="w-20 bg-slate-900 border border-slate-600 rounded p-1.5 text-sm outline-none focus:border-orange-500 transition-colors"
-                    title="Rate (items/min)"
-                  />
+                  <input type="number" step="any" value={inp.rate} onChange={(e) => updateInput(inp.id, 'rate', e.target.value)} className="w-20 bg-slate-900 border border-slate-600 rounded p-1.5 text-sm outline-none focus:border-orange-500 transition-colors" />
                   <span className="text-slate-500 font-bold text-sm">×</span>
-                  <input 
-                    type="number" min="1" step="1"
-                    value={inp.count || 1} 
-                    onChange={(e) => updateInput(inp.id, 'count', e.target.value)}
-                    className="w-16 bg-slate-900 border border-slate-600 rounded p-1.5 text-sm outline-none focus:border-orange-500 transition-colors"
-                    title="Quantity"
-                  />
-                  <button onClick={() => removeInput(inp.id)} className="text-red-400 hover:bg-slate-700 p-1.5 rounded transition-colors ml-auto">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  <input type="number" min="1" value={inp.count || 1} onChange={(e) => updateInput(inp.id, 'count', e.target.value)} className="w-16 bg-slate-900 border border-slate-600 rounded p-1.5 text-sm outline-none focus:border-orange-500 transition-colors" />
+                  <button onClick={() => removeInput(inp.id)} className="text-red-400 hover:bg-slate-700 p-1.5 rounded transition-colors ml-auto"><Trash2 className="w-4 h-4" /></button>
                 </div>
               ))}
             </div>
           </div>
 
-          {/* Outputs */}
           <div>
             <div className="flex justify-between items-center mb-2">
-              <label className="text-sm font-semibold text-slate-300">Outputs (Total: {totalOutput.toFixed(1)})</label>
+              <label className="text-sm font-semibold text-slate-300">Outputs ({totalOutput.toFixed(1)})</label>
               <button onClick={addOutput} className="text-orange-400 hover:text-orange-300 p-1 bg-slate-700 rounded transition-colors">
                 <Plus className="w-4 h-4" />
               </button>
@@ -537,208 +535,125 @@ export default function App() {
               {outputs.map((out, i) => (
                 <div key={out.id} className="flex gap-2 items-center">
                   <span className="bg-slate-700 px-2 py-1.5 rounded text-xs font-mono flex-shrink-0 flex items-center">Out {i+1}</span>
-                  <input 
-                    type="number" min="0" step="any"
-                    value={out.rate} 
-                    onChange={(e) => updateOutput(out.id, 'rate', e.target.value)}
-                    className="w-20 bg-slate-900 border border-slate-600 rounded p-1.5 text-sm outline-none focus:border-orange-500 transition-colors"
-                    title="Rate (items/min)"
-                  />
+                  <input type="number" step="any" value={out.rate} onChange={(e) => updateOutput(out.id, 'rate', e.target.value)} className="w-20 bg-slate-900 border border-slate-600 rounded p-1.5 text-sm outline-none focus:border-orange-500 transition-colors" />
                   <span className="text-slate-500 font-bold text-sm">×</span>
-                  <input 
-                    type="number" min="1" step="1"
-                    value={out.count || 1} 
-                    onChange={(e) => updateOutput(out.id, 'count', e.target.value)}
-                    className="w-16 bg-slate-900 border border-slate-600 rounded p-1.5 text-sm outline-none focus:border-orange-500 transition-colors"
-                    title="Quantity"
-                  />
-                  <button onClick={() => removeOutput(out.id)} className="text-red-400 hover:bg-slate-700 p-1.5 rounded transition-colors ml-auto">
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  <input type="number" min="1" value={out.count || 1} onChange={(e) => updateOutput(out.id, 'count', e.target.value)} className="w-16 bg-slate-900 border border-slate-600 rounded p-1.5 text-sm outline-none focus:border-orange-500 transition-colors" />
+                  <button onClick={() => removeOutput(out.id)} className="text-red-400 hover:bg-slate-700 p-1.5 rounded transition-colors ml-auto"><Trash2 className="w-4 h-4" /></button>
                 </div>
               ))}
             </div>
           </div>
-
         </div>
 
         <div className="p-5 border-t border-slate-700 bg-slate-800">
-          {error && (
-            <div className="mb-4 text-xs bg-red-900/50 border border-red-500/50 text-red-200 p-2 rounded flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-              <span>{error}</span>
-            </div>
-          )}
-          <button 
-            onClick={handleGenerate}
-            className="w-full bg-orange-500 hover:bg-orange-600 text-white font-bold py-2 px-4 rounded shadow-lg transition-colors flex items-center justify-center gap-2"
-          >
+          {error && <div className="mb-4 text-xs bg-red-900/50 border border-red-500/50 text-red-200 p-2 rounded flex items-start gap-2"><AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" /><span>{error}</span></div>}
+          <button onClick={handleGenerate} className="w-full bg-orange-500 hover:bg-orange-600 text-white font-bold py-2 px-4 rounded shadow-lg transition-colors flex items-center justify-center gap-2">
             {sessionId ? "Update & Sync Graph" : "Generate Graph"}
           </button>
         </div>
       </div>
 
-      {/* Main Canvas Area */}
       <div 
         className={`flex-1 relative bg-[#0f172a] overflow-hidden ${(isPanning || draggingNodeId) ? 'cursor-grabbing' : 'cursor-grab'}`}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onWheel={handleWheel}
-        style={{
-          backgroundImage: 'radial-gradient(#1e293b 1px, transparent 1px)',
-          backgroundSize: `${20 * zoom}px ${20 * zoom}px`,
-          backgroundPosition: `${pan.x}px ${pan.y}px`
-        }}
+        onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} onWheel={handleWheel}
+        style={{ backgroundImage: 'radial-gradient(#1e293b 1px, transparent 1px)', backgroundSize: `${20 * zoom}px ${20 * zoom}px`, backgroundPosition: `${pan.x}px ${pan.y}px` }}
       >
-        
-        {/* Zoom Controls */}
-        <div 
-          className="fixed top-4 right-4 z-20 flex gap-2 bg-slate-800 p-1 rounded-lg border border-slate-700 shadow-xl cursor-default"
-          onMouseDown={e => e.stopPropagation()}
-          onWheel={e => e.stopPropagation()}
-        >
+        <div className="fixed top-4 right-4 z-20 flex gap-2 bg-slate-800 p-1 rounded-lg border border-slate-700 shadow-xl cursor-default" onMouseDown={e => e.stopPropagation()} onWheel={e => e.stopPropagation()}>
            <button onClick={() => setZoom(z => Math.max(0.1, z - 0.1))} className="p-2 hover:bg-slate-700 rounded text-slate-300">-</button>
            <span className="px-3 py-2 text-sm font-mono flex items-center bg-slate-900 rounded min-w-[3.5rem] justify-center">{Math.round(zoom * 100)}%</span>
            <button onClick={() => setZoom(z => Math.min(3, z + 0.1))} className="p-2 hover:bg-slate-700 rounded text-slate-300">+</button>
-           <button onClick={() => { setZoom(1); setPan({x: 50, y: 50}); }} className="p-2 hover:bg-slate-700 rounded text-slate-300 ml-2 border-l border-slate-600">
-              <Maximize2 className="w-4 h-4" />
-           </button>
+           <button onClick={() => { setZoom(1); setPan({x: 50, y: 50}); }} className="p-2 hover:bg-slate-700 rounded text-slate-300 ml-2 border-l border-slate-600"><Maximize2 className="w-4 h-4" /></button>
         </div>
 
         <div className="w-full h-full">
           <svg width="100%" height="100%" className="overflow-visible">
             <defs>
-              <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-                <polygon points="0 0, 10 3.5, 0 7" fill="#475569" />
-              </marker>
-              <style>
-                {`
-                  @keyframes flow {
-                    to { stroke-dashoffset: -20; }
-                  }
-                  .belt-anim {
-                    animation: flow 0.8s linear infinite;
-                  }
-                `}
-              </style>
+              <style>{`@keyframes flow { to { stroke-dashoffset: -20; } } .belt-anim { animation: flow 0.8s linear infinite; }`}</style>
             </defs>
 
             <g transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}>
-              {/* Draw Edges */}
               {graph.edges.map(e => {
-              const src = graph.nodes.find(n => n.id === e.source);
-              const tgt = graph.nodes.find(n => n.id === e.target);
-              if (!src || !tgt) return null;
+                const src = graph.nodes.find(n => n.id === e.source);
+                const tgt = graph.nodes.find(n => n.id === e.target);
+                if (!src || !tgt) return null;
 
-              const x1 = src.x + 60;
-              const y1 = src.y;
-              const x2 = tgt.x - 60;
-              const y2 = tgt.y;
-              
-              const cx = (x1 + x2) / 2;
-              const pathStr = `M ${x1} ${y1} C ${cx} ${y1}, ${cx} ${y2}, ${x2} ${y2}`;
-              
-              let edgeColor = BELT_TIERS.find(t => e.rate <= t.rate)?.color || BELT_TIERS[BELT_TIERS.length - 1].color;
-              
-              if (src.type === 'Splitter') {
-                const outEdges = graph.edges.filter(ed => ed.source === src.id);
-                outEdges.sort((a, b) => {
-                  const tgtA = graph.nodes.find(n => n.id === a.target);
-                  const tgtB = graph.nodes.find(n => n.id === b.target);
-                  return (tgtA?.y || 0) - (tgtB?.y || 0);
-                });
-                const edgeIndex = outEdges.findIndex(ed => ed.id === e.id);
-                const SPLITTER_COLORS = ['#38bdf8', '#a3e635', '#f472b6']; // Sky, Lime, Pink
-                edgeColor = SPLITTER_COLORS[edgeIndex % SPLITTER_COLORS.length];
-              }
+                const key = `${e.source}_${e.target}`;
+                const group = edgeGroups[key];
+                const indexInGroup = group.findIndex(ed => ed.id === e.id);
+                const totalInGroup = group.length;
 
-              const isBuilt = nodeStates[tgt.id]?.built;
+                const x1 = src.x + 60; const y1 = src.y;
+                const x2 = tgt.x - 60; const y2 = tgt.y;
+                const offset = totalInGroup > 1 ? (indexInGroup - (totalInGroup - 1) / 2) * 45 : 0;
+                
+                const midX = (x1 + x2) / 2; const midY = (y1 + y2) / 2 + offset;
+                const pathStr = `M ${x1} ${y1} C ${midX} ${y1 + offset * 1.5}, ${midX} ${y2 + offset * 1.5}, ${x2} ${y2}`;
+                
+                let edgeColor = BELT_TIERS.find(t => e.rate <= t.rate)?.color || '#ec4899';
+                if (src.type === 'Splitter' && !e.isThrottle) {
+                    const outEdges = graph.edges.filter(ed => ed.source === src.id && !ed.isThrottle);
+                    outEdges.sort((a, b) => (graph.nodes.find(n => n.id === a.target)?.y || 0) - (graph.nodes.find(n => n.id === b.target)?.y || 0));
+                    const edgeIndex = outEdges.findIndex(ed => ed.id === e.id);
+                    edgeColor = ['#38bdf8', '#a3e635', '#f472b6'][edgeIndex % 3];
+                }
 
-              return (
-                <g key={e.id} opacity={isBuilt ? 0.25 : 1}>
-                  <path d={pathStr} fill="none" stroke="#1e293b" strokeWidth="12" />
-                  <path d={pathStr} fill="none" stroke={edgeColor} strokeWidth="4" strokeOpacity="0.4" />
-                  <path 
-                    d={pathStr} 
-                    fill="none" 
-                    stroke={edgeColor} 
-                    strokeWidth="4" 
-                    strokeDasharray="6 8"
-                    className={isBuilt ? '' : 'belt-anim'}
-                  />
-                  <rect x={(x1+x2)/2 - 20} y={(y1+y2)/2 - 12} width="40" height="20" rx="4" fill="#1e293b" stroke="#334155" />
-                  <text x={(x1+x2)/2} y={(y1+y2)/2 + 4} fill={isBuilt ? '#64748b' : '#cbd5e1'} fontSize="10" textAnchor="middle" fontWeight="bold">
-                    {e.rate.toFixed(1).replace(/\.0$/, '')}
-                  </text>
-                </g>
-              );
-            })}
+                const isBuilt = nodeStates[tgt.id]?.built;
 
-            {/* Draw Nodes */}
-            {graph.nodes.map(n => {
-              let fill, stroke, bg;
-              if (n.type === 'Input') { fill = '#10b981'; stroke = '#047857'; bg = '#064e3b'; }
-              else if (n.type === 'Output') { fill = '#3b82f6'; stroke = '#1d4ed8'; bg = '#1e3a8a'; }
-              else if (n.type === 'Splitter') { fill = '#f97316'; stroke = '#c2410c'; bg = '#431407'; }
-              else if (n.type === 'Merger') { fill = '#8b5cf6'; stroke = '#6d28d9'; bg = '#2e1065'; }
-
-              const stateInfo = nodeStates[n.id] || {};
-              const isBuilt = stateInfo.built;
-
-              return (
-                <g 
-                  key={n.id} 
-                  transform={`translate(${n.x}, ${n.y})`} 
-                  className={draggingNodeId === n.id ? 'cursor-grabbing' : 'cursor-grab'}
-                  onMouseDown={(e) => { e.stopPropagation(); setDraggingNodeId(n.id); }}
-                  opacity={isBuilt ? 0.4 : 1}
-                >
-                  <rect x="-60" y="-30" width="120" height="60" rx="8" fill="#000" opacity="0.3" transform="translate(4, 4)" />
-                  <rect x="-60" y="-30" width="120" height="60" rx="8" fill={bg} stroke={stroke} strokeWidth="2" />
-                  
-                  <rect x="-60" y="-30" width="120" height="15" rx="8" fill={fill} />
-                  <rect x="-60" y="-20" width="120" height="5" fill={fill} />
-
-                  <text x="0" y="-18" fill="#fff" fontSize="10" fontWeight="bold" textAnchor="middle" style={{textTransform: 'uppercase', letterSpacing: '1px'}}>
-                    {n.type}
-                  </text>
-
-                  <text x="0" y="8" fill="#e2e8f0" fontSize="14" fontWeight="bold" textAnchor="middle">
-                    {n.label}
-                  </text>
-                  <text x="0" y="22" fill="#94a3b8" fontSize="10" textAnchor="middle">
-                    {n.rate.toFixed(1).replace(/\.0$/, '')} /m
-                  </text>
-
-                  {(n.type === 'Output' || n.type === 'Splitter' || n.type === 'Merger') && (
-                    <circle cx="-60" cy="0" r="4" fill="#0f172a" stroke={stroke} strokeWidth="2" />
-                  )}
-                  {(n.type === 'Input' || n.type === 'Splitter' || n.type === 'Merger') && (
-                    <circle cx="60" cy="0" r="4" fill="#0f172a" stroke={stroke} strokeWidth="2" />
-                  )}
-
-                  {/* Built Toggle & Author */}
-                  <g 
-                    transform="translate(40, -27)"
-                    onMouseDown={(e) => { e.stopPropagation(); toggleNodeBuilt(n.id); }}
-                    className="cursor-pointer hover:opacity-80"
-                  >
-                    <rect width="16" height="16" rx="4" fill={isBuilt ? '#10b981' : '#0f172a'} stroke={isBuilt ? '#047857' : 'rgba(255,255,255,0.3)'} strokeWidth="1" />
-                    {isBuilt && <path d="M4 8 l3 3 l5 -5" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />}
+                return (
+                  <g key={e.id} opacity={isBuilt ? 0.25 : 1}>
+                    <path d={pathStr} fill="none" stroke="#1e293b" strokeWidth="12" />
+                    <path d={pathStr} fill="none" stroke={edgeColor} strokeWidth="4" strokeOpacity="0.4" />
+                    <path d={pathStr} fill="none" stroke={edgeColor} strokeWidth="4" strokeDasharray="6 8" className={isBuilt ? '' : 'belt-anim'} />
+                    
+                    {/* Rate Label Box */}
+                    <g transform={`translate(${midX}, ${midY})`}>
+                      <rect x="-35" y="-12" width="70" height="24" rx="4" fill={e.isThrottle ? '#78350f' : '#1e293b'} stroke={e.isThrottle ? '#eab308' : '#334155'} strokeWidth="1.5" />
+                      <text x="0" y="4" fill={isBuilt ? '#64748b' : '#cbd5e1'} fontSize="10" textAnchor="middle" fontWeight="bold">
+                        {e.rate.toFixed(1).replace(/\.0$/, '')} {e.isThrottle && 'LIMIT'}
+                      </text>
+                      {e.isThrottle && (
+                        <g transform="translate(-48, -8) scale(0.6)">
+                           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" fill="#eab308" opacity="0.3" />
+                           <rect x="7" y="11" width="10" height="8" rx="2" fill="#eab308" />
+                           <path d="M9 11V8a3 3 0 0 1 6 0v3" fill="none" stroke="#eab308" strokeWidth="2" />
+                        </g>
+                      )}
+                    </g>
                   </g>
-                  {isBuilt && stateInfo.byName && (
-                    <text x="48" y="-32" fill="#38bdf8" fontSize="9" fontWeight="bold" textAnchor="end">
-                      {stateInfo.byName}
-                    </text>
-                  )}
-                </g>
-              );
-            })}
+                );
+              })}
+
+              {graph.nodes.map(n => {
+                let fill, stroke, bg;
+                if (n.type === 'Input') { fill = '#10b981'; stroke = '#047857'; bg = '#064e3b'; }
+                else if (n.type === 'Output') { fill = '#3b82f6'; stroke = '#1d4ed8'; bg = '#1e3a8a'; }
+                else if (n.type === 'Splitter') { fill = '#f97316'; stroke = '#c2410c'; bg = '#431407'; }
+                else if (n.type === 'Merger') { fill = '#8b5cf6'; stroke = '#6d28d9'; bg = '#2e1065'; }
+
+                const stateInfo = nodeStates[n.id] || {};
+                const isBuilt = stateInfo.built;
+
+                return (
+                  <g key={n.id} transform={`translate(${n.x}, ${n.y})`} className={draggingNodeId === n.id ? 'cursor-grabbing' : 'cursor-grab'} onMouseDown={(e) => { e.stopPropagation(); setDraggingNodeId(n.id); }} opacity={isBuilt ? 0.4 : 1}>
+                    <rect x="-60" y="-30" width="120" height="60" rx="8" fill="#000" opacity="0.3" transform="translate(4, 4)" />
+                    <rect x="-60" y="-30" width="120" height="60" rx="8" fill={bg} stroke={stroke} strokeWidth="2" />
+                    <rect x="-60" y="-30" width="120" height="15" rx="8" fill={fill} />
+                    <rect x="-60" y="-20" width="120" height="5" fill={fill} />
+                    <text x="0" y="-18" fill="#fff" fontSize="10" fontWeight="bold" textAnchor="middle" style={{textTransform: 'uppercase', letterSpacing: '1px'}}>{n.type}</text>
+                    <text x="0" y="8" fill="#e2e8f0" fontSize="14" fontWeight="bold" textAnchor="middle">{n.label}</text>
+                    <text x="0" y="22" fill="#94a3b8" fontSize="10" textAnchor="middle">{n.rate.toFixed(1).replace(/\.0$/, '')} /m</text>
+                    {(n.type === 'Output' || n.type === 'Splitter' || n.type === 'Merger') && <circle cx="-60" cy="0" r="4" fill="#0f172a" stroke={stroke} strokeWidth="2" />}
+                    {(n.type === 'Input' || n.type === 'Splitter' || n.type === 'Merger') && <circle cx="60" cy="0" r="4" fill="#0f172a" stroke={stroke} strokeWidth="2" />}
+                    <g transform="translate(40, -27)" onMouseDown={(e) => { e.stopPropagation(); toggleNodeBuilt(n.id); }} className="cursor-pointer hover:opacity-80">
+                      <rect width="16" height="16" rx="4" fill={isBuilt ? '#10b981' : '#0f172a'} stroke={isBuilt ? '#047857' : 'rgba(255,255,255,0.3)'} strokeWidth="1" />
+                      {isBuilt && <path d="M4 8 l3 3 l5 -5" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />}
+                    </g>
+                    {isBuilt && stateInfo.byName && <text x="48" y="-32" fill="#38bdf8" fontSize="9" fontWeight="bold" textAnchor="end">{stateInfo.byName}</text>}
+                  </g>
+                );
+              })}
             </g>
           </svg>
-
           {graph.nodes.length === 0 && !error && (
              <div className="absolute text-slate-500 font-mono text-lg flex flex-col items-center gap-4 bg-slate-800/80 p-8 rounded-xl border border-slate-700 backdrop-blur-sm" style={{ top: '50%', left: '50%', transform: 'translate(-50%, -50%)'}}>
                 <Settings2 className="w-12 h-12 text-slate-600 animate-spin" style={{animationDuration: '3s'}} />
