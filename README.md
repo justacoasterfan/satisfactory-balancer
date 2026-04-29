@@ -4,7 +4,7 @@ A robust, interactive load balancer calculator for the game **Satisfactory**.
 
 Unlike standard splitter calculators, this tool not only calculates the exact splitters and mergers needed (using standard 1-to-3 and 3-to-1 mechanics) but also factors in **maximum belt capacities** (Mk.1 through Mk.6). It guarantees that no intermediate belt in the generated graph will ever exceed the maximum transfer rate you have available.
 
-[**🚀 Play with the Live Calculator Here!**](https://<your-github-username>.github.io/satisfactory-balancer/) *(Replace `<your-github-username>` in this link)*
+[**🚀 Play with the Live Calculator Here!**](https://justacoasterfan.github.io/satisfactory-balancer/)
 
 ## ✨ Features
 
@@ -32,7 +32,7 @@ If you want to run this project locally on your machine, follow these steps:
 1. **Clone the repository:**
 
    ```bash
-   git clone [https://github.com/](https://github.com/)<your-github-username>/satisfactory-balancer.git
+   git clone [https://github.com/](https://github.com/)justacoasterfan/satisfactory-balancer.git
    cd satisfactory-balancer
    ```
 
