@@ -15,20 +15,11 @@ const firebaseConfig = {
   measurementId: "G-9F8SG9443E"
 };
 
-let app, auth, db;
-const appId = "satisfactory-balancer"; // Give your app a static ID
-
-try {
-  app = initializeApp(firebaseConfig);
-  auth = getAuth(app);
-  db = getFirestore(app);
-} catch (e) {
-  console.error("Firebase init failed:", e);
-}
-
-// Initialize Firebase
+// Initialize everything once
 const app = initializeApp(firebaseConfig);
-const analytics = getAnalytics(app);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = "satisfactory-balancer";
 
 const BELT_TIERS = [
   { level: 1, rate: 60, color: '#6b7280' },    // Mk.1
