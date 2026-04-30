@@ -77,6 +77,17 @@ function generateBalancer(inputs, outputs, maxTier) {
     inputs: []
   }));
 
+  // 1.5 Exact Direct Match Phase
+  for (let i = available.length - 1; i >= 0; i--) {
+    let inp = available[i];
+    let t = targets.find(t => t.connected === 0 && Math.abs(t.rate - inp.rate) < 0.001);
+    if (t) {
+      t.inputs.push({ ...inp, isThrottle: false });
+      t.connected += inp.rate;
+      available.splice(i, 1);
+    }
+  }
+
   // 2. Consolidation Phase
   let consolidated = true;
   while (consolidated) {
@@ -139,13 +150,10 @@ function generateBalancer(inputs, outputs, maxTier) {
                 let sId = addNode('Splitter', belt.rate, 'Splitter');
                 addEdge(belt.source, sId, belt.rate);
 
-                // Output 1 goes directly to target, tagged as a throttle
                 t.inputs.push({ source: sId, rate: tRem, isThrottle: true });
                 t.connected += tRem;
 
-                // Output 2 is the remainder
                 available.push({ source: sId, rate: belt.rate - tRem });
-                
                 tierMatchMade = true;
                 break;
             }
@@ -234,19 +242,42 @@ function generateBalancer(inputs, outputs, maxTier) {
     layerNodes[n.layer].push(n);
   });
 
-  for (let pass = 0; pass < 3; pass++) {
-    for (let l = 0; l <= maxLayer + 1; l++) {
+  // Initial temporary Y assignment to establish relative order
+  Object.keys(layerNodes).forEach(l => {
+    layerNodes[l].forEach((n, idx) => { n.y = idx * 250; });
+  });
+
+  // Sugiyama Barycenter Method for Crossing Reduction (Dual-sweep)
+  for (let pass = 0; pass < 6; pass++) {
+    // Forward sweep (Left to Right: sort by average Parent Y)
+    for (let l = 1; l <= maxLayer + 1; l++) {
       if (!layerNodes[l]) continue;
       layerNodes[l].forEach(n => {
         let parents = edges.filter(e => e.target === n.id).map(e => nodes.find(src => src.id === e.source));
-        n.avgParentY = parents.length > 0 ? parents.reduce((sum, p) => sum + p.y, 0) / parents.length : (n.y || 0);
+        n.barycenter = parents.length > 0 ? parents.reduce((sum, p) => sum + p.y, 0) / parents.length : n.y;
       });
-      layerNodes[l].sort((a, b) => a.avgParentY - b.avgParentY);
-      layerNodes[l].forEach((n, idx) => {
-        n.y = (Math.max(800, layerNodes[l].length * 150) / (layerNodes[l].length + 1)) * (idx + 1);
+      layerNodes[l].sort((a, b) => a.barycenter - b.barycenter);
+      layerNodes[l].forEach((n, idx) => { n.y = idx * 250; });
+    }
+    
+    // Backward sweep (Right to Left: sort by average Child Y)
+    for (let l = maxLayer; l >= 0; l--) {
+      if (!layerNodes[l]) continue;
+      layerNodes[l].forEach(n => {
+        let children = edges.filter(e => e.source === n.id).map(e => nodes.find(tgt => tgt.id === e.target));
+        n.barycenter = children.length > 0 ? children.reduce((sum, c) => sum + c.y, 0) / children.length : n.y;
       });
+      layerNodes[l].sort((a, b) => a.barycenter - b.barycenter);
+      layerNodes[l].forEach((n, idx) => { n.y = idx * 250; });
     }
   }
+
+  // Final visual Y expansion and spacing
+  Object.keys(layerNodes).forEach(l => {
+    layerNodes[l].forEach((n, idx) => {
+      n.y = (Math.max(1200, layerNodes[l].length * 250) / (layerNodes[l].length + 1)) * (idx + 1);
+    });
+  });
 
   Object.keys(layerNodes).forEach(l => {
     layerNodes[l].forEach(n => {
@@ -264,6 +295,7 @@ export default function App() {
   const [maxTier, setMaxTier] = useState(270);
   const [graph, setGraph] = useState({ nodes: [], edges: [] });
   const [nodeStates, setNodeStates] = useState({}); 
+  const [hasChanges, setHasChanges] = useState(false); 
   
   const [error, setError] = useState('');
   const [zoom, setZoom] = useState(1);
@@ -275,6 +307,18 @@ export default function App() {
   const [userName, setUserName] = useState('');
   const [sessionId, setSessionId] = useState(new URLSearchParams(window.location.search).get('session') || null);
   const [copied, setCopied] = useState(false);
+  const [syncLayout, setSyncLayout] = useState(true);
+  
+  // Refs to prevent stale closures and infinite loop triggers
+  const lastSyncRef = useRef(''); 
+  const graphRef = useRef(graph);
+  const draggingNodeRef = useRef(draggingNodeId);
+  const syncLayoutRef = useRef(syncLayout);
+  const latestLayoutRef = useRef(null);
+
+  useEffect(() => { graphRef.current = graph; }, [graph]);
+  useEffect(() => { draggingNodeRef.current = draggingNodeId; }, [draggingNodeId]);
+  useEffect(() => { syncLayoutRef.current = syncLayout; }, [syncLayout]);
 
   useEffect(() => {
     if (!auth) return;
@@ -306,10 +350,40 @@ export default function App() {
         if (data.maxTier) setMaxTier(data.maxTier);
         if (data.nodeStates) setNodeStates(data.nodeStates);
 
-        if (data.inputs && data.outputs) {
+        let currentGraph = graphRef.current;
+
+        // ONLY regenerate layout if the core setup structure was modified (tracked via graphRev)
+        if (data.graphRev && data.graphRev !== lastSyncRef.current) {
+           lastSyncRef.current = data.graphRev;
            const flatInputs = data.inputs.flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
            const flatOutputs = data.outputs.flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
-           setGraph(generateBalancer(flatInputs, flatOutputs, data.maxTier || 270));
+           currentGraph = generateBalancer(flatInputs, flatOutputs, data.maxTier || 270);
+           setGraph(currentGraph);
+           setHasChanges(false);
+        }
+
+        if (data.layout) latestLayoutRef.current = data.layout;
+
+        // Always apply synced positions to ensure dragged layouts stay organized for everyone
+        if (data.layout && currentGraph.nodes.length > 0 && syncLayoutRef.current) {
+           setGraph(prev => {
+               let changed = false;
+               const nodesToUpdate = (currentGraph !== graphRef.current) ? currentGraph.nodes : prev.nodes;
+               const updatedNodes = nodesToUpdate.map(n => {
+                   const syncedPos = data.layout[n.id];
+                   // Ignore layout syncs for a node if we are currently dragging it locally
+                   if (syncedPos && n.id !== draggingNodeRef.current) {
+                       if (Math.abs(syncedPos.x - n.x) > 0.1 || Math.abs(syncedPos.y - n.y) > 0.1) {
+                           changed = true;
+                           return { ...n, x: syncedPos.x, y: syncedPos.y };
+                       }
+                   }
+                   return n;
+               });
+               
+               if (currentGraph !== graphRef.current) return { ...currentGraph, nodes: updatedNodes };
+               return changed ? { ...prev, nodes: updatedNodes } : prev;
+           });
         }
       }
     }, (err) => {
@@ -340,7 +414,11 @@ export default function App() {
     const flatInputs = inputs.flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
     const flatOutputs = outputs.flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
 
+    const newRev = Date.now().toString();
+    lastSyncRef.current = newRev;
+    
     setNodeStates({});
+    setHasChanges(false);
     const newGraph = generateBalancer(flatInputs, flatOutputs, maxTier);
     setGraph(newGraph);
     setZoom(1);
@@ -349,7 +427,7 @@ export default function App() {
     if (sessionId && db && user) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'sessions', sessionId);
-        await setDoc(docRef, { inputs, outputs, maxTier, nodeStates: {} }, { merge: true });
+        await setDoc(docRef, { inputs, outputs, maxTier, nodeStates: {}, graphRev: newRev, layout: deleteField() }, { merge: true });
       } catch (err) {
         console.error("Failed to sync structural changes", err);
       }
@@ -359,6 +437,26 @@ export default function App() {
   useEffect(() => {
     if (!sessionId) handleGenerate();
   }, []);
+
+  // Apply server layout immediately if toggled back on
+  useEffect(() => {
+    if (syncLayout && latestLayoutRef.current && graphRef.current.nodes.length > 0) {
+        setGraph(prev => {
+           let changed = false;
+           const updatedNodes = prev.nodes.map(n => {
+               const syncedPos = latestLayoutRef.current[n.id];
+               if (syncedPos && n.id !== draggingNodeRef.current) {
+                   if (Math.abs(syncedPos.x - n.x) > 0.1 || Math.abs(syncedPos.y - n.y) > 0.1) {
+                       changed = true;
+                       return { ...n, x: syncedPos.x, y: syncedPos.y };
+                   }
+               }
+               return n;
+           });
+           return changed ? { ...prev, nodes: updatedNodes } : prev;
+       });
+    }
+  }, [syncLayout]);
 
   const edgeGroups = useMemo(() => {
     const groups = {};
@@ -370,13 +468,13 @@ export default function App() {
     return groups;
   }, [graph.edges]);
 
-  const addInput = () => setInputs([...inputs, { id: Date.now(), rate: 60, count: 1 }]);
-  const removeInput = (id) => setInputs(inputs.filter(i => i.id !== id));
-  const updateInput = (id, field, val) => setInputs(inputs.map(i => i.id === id ? { ...i, [field]: Number(val) } : i));
+  const addInput = () => { setInputs([...inputs, { id: Date.now(), rate: 60, count: 1 }]); setHasChanges(true); };
+  const removeInput = (id) => { setInputs(inputs.filter(i => i.id !== id)); setHasChanges(true); };
+  const updateInput = (id, field, val) => { setInputs(inputs.map(i => i.id === id ? { ...i, [field]: Number(val) } : i)); setHasChanges(true); };
 
-  const addOutput = () => setOutputs([...outputs, { id: Date.now(), rate: 60, count: 1 }]);
-  const removeOutput = (id) => setOutputs(outputs.filter(o => o.id !== id));
-  const updateOutput = (id, field, val) => setOutputs(outputs.map(o => o.id === id ? { ...o, [field]: Number(val) } : o));
+  const addOutput = () => { setOutputs([...outputs, { id: Date.now(), rate: 60, count: 1 }]); setHasChanges(true); };
+  const removeOutput = (id) => { setOutputs(outputs.filter(o => o.id !== id)); setHasChanges(true); };
+  const updateOutput = (id, field, val) => { setOutputs(outputs.map(o => o.id === id ? { ...o, [field]: Number(val) } : o)); setHasChanges(true); };
 
   const handleMouseDown = (e) => {
     if (e.button !== 0) return; 
@@ -394,7 +492,18 @@ export default function App() {
     }
   };
   
-  const handleMouseUp = () => { setIsPanning(false); setDraggingNodeId(null); };
+  const handleMouseUp = () => { 
+    setIsPanning(false); 
+    // Push the organized layout directly to Firebase so it stays formatted for everyone
+    if (draggingNodeId && sessionId && db && user && syncLayout) {
+        const draggedNode = graphRef.current.nodes.find(n => n.id === draggingNodeId);
+        if (draggedNode) {
+            const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'sessions', sessionId);
+            setDoc(docRef, { layout: { [draggingNodeId]: { x: draggedNode.x, y: draggedNode.y } } }, { merge: true }).catch(e => console.error(e));
+        }
+    }
+    setDraggingNodeId(null); 
+  };
 
   const handleWheel = (e) => {
     if (e.deltaY < 0) setZoom(z => Math.min(3, z + 0.1));
@@ -423,10 +532,23 @@ export default function App() {
 
   const startSession = async () => {
     if (!db || !user) { setError("Connecting to server, please wait..."); return; }
+    if (hasChanges) { 
+      setError("Please click 'Generate Graph' to apply your unsaved changes before starting the session."); 
+      return; 
+    }
     const newSid = Math.random().toString(36).substring(2, 10);
+    const newRev = lastSyncRef.current || Date.now().toString();
+    lastSyncRef.current = newRev;
+
+    // Capture the existing layout so any pre-session organization isn't lost
+    const initialLayout = {};
+    graphRef.current.nodes.forEach(n => {
+        initialLayout[n.id] = { x: n.x, y: n.y };
+    });
+
     try {
       const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'sessions', newSid);
-      await setDoc(docRef, { inputs, outputs, maxTier, nodeStates });
+      await setDoc(docRef, { inputs, outputs, maxTier, nodeStates, graphRev: newRev, layout: initialLayout });
       setSessionId(newSid);
       window.history.pushState({}, '', '?session=' + newSid);
     } catch (err) {
@@ -476,6 +598,18 @@ export default function App() {
                 <div className="flex items-center justify-between bg-green-900/30 border border-green-500/30 px-3 py-1.5 rounded">
                   <span className="text-xs text-green-400 font-semibold flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> Live Session</span>
                 </div>
+                
+                <div className="flex items-center justify-between bg-slate-900 border border-slate-700 px-3 py-2 rounded">
+                  <span className="text-xs text-slate-300 font-semibold">Shared Organization</span>
+                  <button
+                    onClick={() => setSyncLayout(!syncLayout)}
+                    className={`w-8 h-4 rounded-full relative transition-colors focus:outline-none ${syncLayout ? 'bg-blue-500' : 'bg-slate-600'}`}
+                    title={syncLayout ? "Layout is synced with everyone" : "Layout is personal and local"}
+                  >
+                    <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${syncLayout ? 'translate-x-4' : 'translate-x-0'}`} />
+                  </button>
+                </div>
+
                 <button 
                   onClick={handleCopyLink}
                   className="w-full bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm py-2 px-4 rounded transition-colors flex justify-center items-center gap-2"
@@ -491,7 +625,7 @@ export default function App() {
             <label className="block text-sm font-semibold text-slate-300 mb-2">Maximum Belt Tier</label>
             <select 
               value={maxTier}
-              onChange={(e) => setMaxTier(Number(e.target.value))}
+              onChange={(e) => { setMaxTier(Number(e.target.value)); setHasChanges(true); }}
               className="w-full bg-slate-700 border border-slate-600 rounded-md p-2 text-sm focus:ring-2 focus:ring-orange-500 outline-none transition-colors"
             >
               {BELT_TIERS.map(tier => (
@@ -547,7 +681,7 @@ export default function App() {
 
         <div className="p-5 border-t border-slate-700 bg-slate-800">
           {error && <div className="mb-4 text-xs bg-red-900/50 border border-red-500/50 text-red-200 p-2 rounded flex items-start gap-2"><AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" /><span>{error}</span></div>}
-          <button onClick={handleGenerate} className="w-full bg-orange-500 hover:bg-orange-600 text-white font-bold py-2 px-4 rounded shadow-lg transition-colors flex items-center justify-center gap-2">
+          <button onClick={handleGenerate} className={`w-full text-white font-bold py-2 px-4 rounded shadow-lg transition-colors flex items-center justify-center gap-2 ${hasChanges ? 'bg-orange-600 hover:bg-orange-500 animate-pulse' : 'bg-orange-500 hover:bg-orange-600'}`}>
             {sessionId ? "Update & Sync Graph" : "Generate Graph"}
           </button>
         </div>
