@@ -315,12 +315,10 @@ export default function App() {
   const draggingNodeRef = useRef(draggingNodeId);
   const syncLayoutRef = useRef(syncLayout);
   const latestLayoutRef = useRef(null);
-  const hasChangesRef = useRef(hasChanges);
 
   useEffect(() => { graphRef.current = graph; }, [graph]);
   useEffect(() => { draggingNodeRef.current = draggingNodeId; }, [draggingNodeId]);
   useEffect(() => { syncLayoutRef.current = syncLayout; }, [syncLayout]);
-  useEffect(() => { hasChangesRef.current = hasChanges; }, [hasChanges]);
 
   useEffect(() => {
     if (!auth) return;
@@ -348,24 +346,23 @@ export default function App() {
       if (snap.exists()) {
         const data = snap.data();
         
-        const structChanged = data.graphRev && data.graphRev !== lastSyncRef.current;
+        const rev = data.graphRev || "legacy";
+        const structChanged = rev !== lastSyncRef.current;
 
-        // Only overwrite local inputs/outputs if we aren't actively editing them, 
-        // OR if someone explicitly pushed a new graph structure.
-        if (!hasChangesRef.current || structChanged) {
-            if (data.inputs) setInputs(data.inputs);
-            if (data.outputs) setOutputs(data.outputs);
-            if (data.maxTier) setMaxTier(data.maxTier);
-        }
-        
         if (data.nodeStates) setNodeStates(data.nodeStates);
         else setNodeStates({});
 
         let currentGraph = graphRef.current;
 
-        // ONLY regenerate layout if the core setup structure was modified (tracked via graphRev)
+        // ONLY overwrite inputs and regenerate layout if a completely new graph structure was pushed.
+        // This fully isolates your local typing from background syncs like checkmarks.
         if (structChanged) {
-           lastSyncRef.current = data.graphRev;
+           lastSyncRef.current = rev;
+           
+           if (data.inputs) setInputs(data.inputs);
+           if (data.outputs) setOutputs(data.outputs);
+           if (data.maxTier) setMaxTier(data.maxTier);
+
            const flatInputs = (data.inputs || []).flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
            const flatOutputs = (data.outputs || []).flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
            currentGraph = generateBalancer(flatInputs, flatOutputs, data.maxTier || 270);
