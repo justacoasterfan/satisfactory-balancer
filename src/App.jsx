@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Plus, Trash2, Settings2, AlertCircle, Maximize2, Users, Link as LinkIcon, Check, Copy } from 'lucide-react';
+import { Plus, Trash2, Settings2, AlertCircle, Maximize2, Users, Link as LinkIcon, Check, Copy, Lock } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, updateDoc, onSnapshot, deleteField } from 'firebase/firestore';
 
 // --- FIREBASE INIT ---
 const firebaseConfig = {
@@ -349,20 +349,26 @@ export default function App() {
         if (data.outputs) setOutputs(data.outputs);
         if (data.maxTier) setMaxTier(data.maxTier);
         if (data.nodeStates) setNodeStates(data.nodeStates);
+        else setNodeStates({});
 
         let currentGraph = graphRef.current;
 
         // ONLY regenerate layout if the core setup structure was modified (tracked via graphRev)
         if (data.graphRev && data.graphRev !== lastSyncRef.current) {
            lastSyncRef.current = data.graphRev;
-           const flatInputs = data.inputs.flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
-           const flatOutputs = data.outputs.flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
+           const flatInputs = (data.inputs || []).flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
+           const flatOutputs = (data.outputs || []).flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
            currentGraph = generateBalancer(flatInputs, flatOutputs, data.maxTier || 270);
            setGraph(currentGraph);
            setHasChanges(false);
         }
 
-        if (data.layout) latestLayoutRef.current = data.layout;
+        // Keep track of the latest synced layout, or properly clear it if the graph was completely regenerated
+        if (data.layout) {
+            latestLayoutRef.current = data.layout;
+        } else {
+            latestLayoutRef.current = null; 
+        }
 
         // Always apply synced positions to ensure dragged layouts stay organized for everyone
         if (data.layout && currentGraph.nodes.length > 0 && syncLayoutRef.current) {
@@ -398,21 +404,43 @@ export default function App() {
 
   const handleGenerate = async () => {
     setError('');
-    if (inputs.length === 0 || outputs.length === 0) {
-      setError('You need at least one input and one output.');
+    if (inputs.length === 0 && outputs.length === 0) {
+      setError('You need at least one input or output.');
       return;
     }
-    if (Math.abs(totalInput - totalOutput) > 0.001) {
-      setError(`Imbalanced! Total Input (${totalInput}) must equal Total Output (${totalOutput}).`);
-      return;
+
+    let finalInputs = [...inputs];
+    let finalOutputs = [...outputs];
+
+    // Core Auto-Balancing Logic
+    const tIn = finalInputs.reduce((sum, i) => sum + (i.rate * (i.count || 1)), 0);
+    const tOut = finalOutputs.reduce((sum, o) => sum + (o.rate * (o.count || 1)), 0);
+
+    if (tIn > tOut + 0.001) {
+      let remainder = Math.round((tIn - tOut) * 1000) / 1000;
+      while (remainder > 0.001) {
+          let chunk = Math.min(remainder, maxTier);
+          finalOutputs.push({ id: Date.now() + Math.random(), rate: chunk, count: 1 });
+          remainder = Math.round((remainder - chunk) * 1000) / 1000;
+      }
+      setOutputs(finalOutputs);
+    } else if (tOut > tIn + 0.001) {
+      let remainder = Math.round((tOut - tIn) * 1000) / 1000;
+      while (remainder > 0.001) {
+          let chunk = Math.min(remainder, maxTier);
+          finalInputs.push({ id: Date.now() + Math.random(), rate: chunk, count: 1 });
+          remainder = Math.round((remainder - chunk) * 1000) / 1000;
+      }
+      setInputs(finalInputs);
     }
-    if (inputs.some(i => i.rate > maxTier) || outputs.some(o => o.rate > maxTier)) {
+
+    if (finalInputs.some(i => i.rate > maxTier) || finalOutputs.some(o => o.rate > maxTier)) {
       setError(`A single belt cannot exceed the Max Tier limit (${maxTier} items/min).`);
       return;
     }
 
-    const flatInputs = inputs.flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
-    const flatOutputs = outputs.flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
+    const flatInputs = finalInputs.flatMap(i => Array.from({ length: i.count || 1 }, () => ({ rate: i.rate })));
+    const flatOutputs = finalOutputs.flatMap(o => Array.from({ length: o.count || 1 }, () => ({ rate: o.rate })));
 
     const newRev = Date.now().toString();
     lastSyncRef.current = newRev;
@@ -427,7 +455,14 @@ export default function App() {
     if (sessionId && db && user) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'sessions', sessionId);
-        await setDoc(docRef, { inputs, outputs, maxTier, nodeStates: {}, graphRev: newRev, layout: deleteField() }, { merge: true });
+        // By replacing the entire document instead of merging, we ensure old layouts & deleted nodes are perfectly wiped across all connected clients.
+        await setDoc(docRef, { 
+            inputs: finalInputs, 
+            outputs: finalOutputs, 
+            maxTier, 
+            nodeStates: {}, 
+            graphRev: newRev 
+        });
       } catch (err) {
         console.error("Failed to sync structural changes", err);
       }
@@ -514,16 +549,22 @@ export default function App() {
     const isCurrentlyBuilt = nodeStates[id]?.built;
     const newState = !isCurrentlyBuilt;
     const newStates = { ...nodeStates };
+    
     if (newState) {
       newStates[id] = { built: true, byName: userName.trim() || 'Anonymous', byUid: user?.uid || 'local' };
     } else {
       delete newStates[id];
     }
+    
     setNodeStates(newStates); 
+    
     if (sessionId && db && user) {
       try {
         const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'sessions', sessionId);
-        await setDoc(docRef, { nodeStates: newStates }, { merge: true });
+        // Use updateDoc with dot notation to safely target and delete nested fields
+        await updateDoc(docRef, { 
+            [`nodeStates.${id}`]: newState ? newStates[id] : deleteField() 
+        });
       } catch (err) {
         console.error("Failed to sync progress", err);
       }
@@ -533,7 +574,7 @@ export default function App() {
   const startSession = async () => {
     if (!db || !user) { setError("Connecting to server, please wait..."); return; }
     if (hasChanges) { 
-      setError("Please click 'Generate Graph' to apply your unsaved changes before starting the session."); 
+      setError("Please click 'Generate Graph' to automatically balance and apply your unsaved changes before starting the session."); 
       return; 
     }
     const newSid = Math.random().toString(36).substring(2, 10);
